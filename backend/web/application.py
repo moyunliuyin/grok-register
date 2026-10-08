@@ -29,7 +29,7 @@ from .jobs import job_coordinator
 from .relogin_jobs import relogin_coordinator
 from .sso_check_jobs import sso_check_coordinator
 from .update_check import ReleaseUpdateService
-from backend.integrations.proxy import validate_http_proxy_url
+from backend.integrations.proxy import normalize_proxy_pool, validate_http_proxy_url
 from backend.integrations import grokiq
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT, STATIC_ROOT
 from backend.shared.version import current_version
@@ -72,6 +72,14 @@ CONFIG_PUBLIC_KEYS = (
     "outlookemail_pick_mode",
     "outlookemail_disable_after_cpa_success",
     "proxy",
+    "proxy_pool",
+    "proxy_chain_via_local",
+    "proxy_gateway_enabled",
+    "proxy_gateway_panel_url",
+    "proxy_gateway_panel_password",
+    "proxy_gateway_proxy_url",
+    "workspace_auto_create",
+    "workspace_name",
     "enable_nsfw",
     "debug_mode",
     "browser_engine",
@@ -136,6 +144,9 @@ SENSITIVE_HINT_KEYS = {
     "yyds_api_key",
     "yyds_jwt",
     "proxy",
+    "proxy_pool",
+    "proxy_gateway_panel_password",
+    "proxy_gateway_proxy_url",
 }
 
 
@@ -342,6 +353,12 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
                 proxy_update = validate_http_proxy_url(proxy_update)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=f"网络代理格式错误: {exc}") from exc
+    proxy_pool_update: Optional[str] = None
+    if "proxy_pool" in updates:
+        try:
+            proxy_pool_update = normalize_proxy_pool(updates.get("proxy_pool"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"代理池格式错误: {exc}") from exc
     changed: List[str] = []
     for key in CONFIG_PUBLIC_KEYS:
         if key not in updates:
@@ -353,6 +370,9 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             "browser_headless",
             "browser_low_traffic_mode",
             "close_browser_on_stop",
+            "proxy_chain_via_local",
+            "proxy_gateway_enabled",
+            "workspace_auto_create",
             "cpa_auto_add",
             "sso_detailed_risk_check",
             "cpa_registration_risk_check",
@@ -434,6 +454,7 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             value = mode
         elif key in (
             "proxy",
+            "proxy_pool",
             "cpa_remote_url",
             "grok2api_remote_url",
             "sub2api_remote_url",
@@ -442,7 +463,12 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             "duckmail_api_base",
             "cloudflare_api_base",
         ):
-            value = proxy_update if key == "proxy" else str(value or "").strip()
+            if key == "proxy":
+                value = proxy_update
+            elif key == "proxy_pool":
+                value = proxy_pool_update
+            else:
+                value = str(value or "").strip()
             if key == "sub2api_remote_url":
                 value = value.rstrip("/")
                 if value and not value.startswith(("http://", "https://")):

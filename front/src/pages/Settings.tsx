@@ -29,6 +29,7 @@ import {
   PageHeader,
   Select,
   Switch,
+  Textarea,
   Toast,
 } from "@/components/ui";
 
@@ -289,6 +290,7 @@ function ConfigField({
   label,
   field,
   type = "text",
+  multiline = false,
   placeholder = "",
   helper = "",
 }: {
@@ -297,6 +299,7 @@ function ConfigField({
   label: string;
   field: string;
   type?: string;
+  multiline?: boolean;
   placeholder?: string;
   helper?: string;
 }) {
@@ -306,23 +309,33 @@ function ConfigField({
     <div className="min-w-0 space-y-2">
       <Label htmlFor={field}>{label}</Label>
       <div className="relative">
-        <Input
-          id={field}
-          type={isPassword && showSecret ? "text" : type}
-          inputMode={type === "number" ? "numeric" : undefined}
-          autoComplete={isPassword ? "new-password" : "off"}
-          className={isPassword ? "pr-10" : undefined}
-          placeholder={placeholder}
-          value={config[field] ?? ""}
-          onChange={(event) =>
-            onFieldChange(
-              field,
-              type === "number" && event.target.value !== ""
-                ? Number(event.target.value)
-                : event.target.value
-            )
-          }
-        />
+        {multiline ? (
+          <Textarea
+            id={field}
+            rows={5}
+            placeholder={placeholder}
+            value={config[field] ?? ""}
+            onChange={(event) => onFieldChange(field, event.target.value)}
+          />
+        ) : (
+          <Input
+            id={field}
+            type={isPassword && showSecret ? "text" : type}
+            inputMode={type === "number" ? "numeric" : undefined}
+            autoComplete={isPassword ? "new-password" : "off"}
+            className={isPassword ? "pr-10" : undefined}
+            placeholder={placeholder}
+            value={config[field] ?? ""}
+            onChange={(event) =>
+              onFieldChange(
+                field,
+                type === "number" && event.target.value !== ""
+                  ? Number(event.target.value)
+                  : event.target.value
+              )
+            }
+          />
+        )}
         {isPassword ? (
           <button
             type="button"
@@ -754,6 +767,58 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 helper="支持无认证或用户名/密码认证的 HTTP(S) 代理；凭据含 @、:、/、#、% 等特殊字符时请使用 URL 百分号编码，例如 @ 写成 %40。注册浏览器与 xAI/OAuth 请求会共用此代理。"
               />
             </div>
+            <div className="sm:col-span-2">
+              <ConfigField
+                {...fieldState}
+                label="代理池"
+                field="proxy_pool"
+                multiline
+                placeholder={"proxy.example.com:8080:user:password\nhttp://user:password@proxy.example.com:8080"}
+                helper="每行一条代理（也支持空白分隔）；按账号轮换，当前账号及重试期间固定。支持 http://、https:// URL，或 host:port:user:password 裸格式。"
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <ToggleRow
+                title="代理链：本机出口 → 代理池节点"
+                description="代理池启用时，先通过当前网络代理（如 127.0.0.1:7890），再连接当前代理池节点；用于动态出口链路。"
+                checked={config.proxy_chain_via_local !== false}
+                onCheckedChange={(value) => setField("proxy_chain_via_local", value)}
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <ToggleRow
+                title="使用动态代理网关切换上游"
+                description="启用后，程序先调用代理网关替换当前上游，再使用网关代理入口出网；与代理池节点配合使用。"
+                checked={!!config.proxy_gateway_enabled}
+                onCheckedChange={(value) => setField("proxy_gateway_enabled", value)}
+              />
+            </div>
+            {config.proxy_gateway_enabled ? (
+              <>
+                <ConfigField
+                  {...fieldState}
+                  label="代理网关面板地址"
+                  field="proxy_gateway_panel_url"
+                  placeholder="https://proxy.example.com"
+                />
+                <ConfigField
+                  {...fieldState}
+                  label="代理网关面板密码"
+                  field="proxy_gateway_panel_password"
+                  type="password"
+                />
+                <div className="sm:col-span-2">
+                  <ConfigField
+                    {...fieldState}
+                    label="代理网关入口"
+                    field="proxy_gateway_proxy_url"
+                    type="password"
+                    placeholder="http://user:password@host:port"
+                    helper="网关公网 HTTP 代理入口；程序会在每个账号开始前调用面板切换代理池上游。"
+                  />
+                </div>
+              </>
+            ) : null}
             <div className="min-w-0 space-y-2">
               <Label htmlFor="browser_engine">浏览器后端</Label>
               <Select
@@ -792,6 +857,21 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 checked={!!config.enable_nsfw}
                 onCheckedChange={(value) => setField("enable_nsfw", value)}
               />
+              <ToggleRow
+                title="注册后自动创建 Workspace"
+                description="进入 xAI Console 创建 Workspace/Team；失败时仍继续保存账号与 CPA"
+                checked={!!config.workspace_auto_create}
+                onCheckedChange={(value) => setField("workspace_auto_create", value)}
+              />
+              {config.workspace_auto_create ? (
+                <ConfigField
+                  {...fieldState}
+                  label="Workspace 名称"
+                  field="workspace_name"
+                  placeholder="My xAI Team"
+                  helper="创建 Workspace/Team 时填写的名称。"
+                />
+              ) : null}
               <ToggleRow
                 title="调试模式"
                 description="强制单账号，结束后保留浏览器"

@@ -2,6 +2,8 @@ import unittest
 from unittest import mock
 
 from backend.integrations.proxy import (
+    normalize_proxy_entry,
+    normalize_proxy_pool,
     parse_http_proxy_url,
     redact_proxy_text,
     redact_proxy_url,
@@ -49,6 +51,22 @@ class DockerProxyResolutionTests(unittest.TestCase):
 
 
 class HttpProxyParsingTests(unittest.TestCase):
+    def test_bare_proxy_format_url_encodes_credentials(self):
+        self.assertEqual(
+            normalize_proxy_entry("proxy.example.com:8080:user@example:p@ss:word"),
+            "http://user%40example:p%40ss%3Aword@proxy.example.com:8080",
+        )
+
+    def test_proxy_pool_accepts_lines_and_whitespace_separators(self):
+        self.assertEqual(
+            normalize_proxy_pool(
+                "proxy-a.example.com:8080:user:pass\n"
+                " https://proxy-b.example.com:8443\t"
+            ),
+            "http://user:pass@proxy-a.example.com:8080\n"
+            "https://proxy-b.example.com:8443",
+        )
+
     def test_authenticated_http_proxy_is_split_for_camoufox(self):
         self.assertEqual(
             parse_http_proxy_url("http://user:password@proxy.example.com:8080"),

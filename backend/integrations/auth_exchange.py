@@ -18,6 +18,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests as _stdlib_requests
 from backend.shared.paths import DATA_ROOT
 
 from curl_cffi import requests
@@ -1469,7 +1470,10 @@ def upload_cpa_auth_remote(
     url = f"{base}/v0/management/auth-files"
     proxies = {"http": proxy, "https": proxy} if proxy else None
     # 不继承 HTTP_PROXY/HTTPS_PROXY；调用方如确实需要代理，必须显式传 proxy。
-    with requests.Session(trust_env=False) as session:
+    # CPA 管理站点在部分 Windows TLS 链路上会重置 curl_cffi；标准 requests
+    # 可通过系统代理或调用方显式代理稳定访问。xAI/SSO 其它请求仍使用上方
+    # curl_cffi 会话，不改变其浏览器指纹链路。
+    with _stdlib_requests.Session() as session:
         resp = session.post(
             url,
             params={"name": name},
@@ -1480,7 +1484,6 @@ def upload_cpa_auth_remote(
             data=json.dumps(record, ensure_ascii=False).encode("utf-8"),
             timeout=timeout,
             proxies=proxies,
-            impersonate="chrome",
         )
     if resp.status_code >= 400:
         body = (resp.text or "").strip()

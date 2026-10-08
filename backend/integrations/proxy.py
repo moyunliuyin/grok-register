@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 
 LOCAL_PROXY_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
@@ -19,6 +19,56 @@ _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _AUTHENTICATED_PROXY_IN_TEXT = re.compile(
     r"([A-Za-z][A-Za-z0-9+.-]*://)([^\s]+)@"
 )
+
+
+def normalize_proxy_entry(proxy: str) -> str:
+    """Normalize one proxy-pool entry to a validated HTTP(S) proxy URL.
+
+    In addition to regular HTTP(S) URLs, accept ``host:port:user:password``
+    and encode the credentials before handing the value to HTTP clients.
+    """
+    value = str(proxy or "").strip()
+    if not value:
+        return ""
+    if "://" in value:
+        return validate_http_proxy_url(value)
+
+    parts = value.split(":", 3)
+    if len(parts) != 4 or not all(parts):
+        raise ValueError("裸代理必须使用 host:port:user:password 格式")
+    host, port, username, password = parts
+    if any(char.isspace() for char in (host, port, username, password)):
+        raise ValueError("代理地址不能包含空白字符")
+    if ":" in host:
+        raise ValueError("裸代理主机暂不支持未加括号的 IPv6 地址")
+    try:
+        port_number = int(port)
+    except ValueError as exc:
+        raise ValueError("代理端口必须是数字") from exc
+    if not 1 <= port_number <= 65535:
+        raise ValueError("代理端口必须在 1 到 65535 之间")
+    normalized = (
+        f"http://{quote(username, safe='')}:{quote(password, safe='')}@"
+        f"{host}:{port_number}"
+    )
+    return validate_http_proxy_url(normalized)
+
+
+def normalize_proxy_pool(value: object) -> str:
+    """Normalize a multiline/whitespace-separated proxy pool.
+
+    The returned value is safe to persist as one normalized URL per line.
+    Empty input is accepted and returns an empty string.
+    """
+    entries = []
+    for index, raw in enumerate(re.split(r"\s+", str(value or "").strip()), start=1):
+        if not raw:
+            continue
+        try:
+            entries.append(normalize_proxy_entry(raw))
+        except ValueError as exc:
+            raise ValueError(f"第 {index} 条代理格式错误: {exc}") from exc
+    return "\n".join(entries)
 
 
 def _proxy_host_port(parsed) -> str:

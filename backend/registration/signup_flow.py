@@ -28,7 +28,9 @@ from backend.automation.session import (
     stop_browser,
 )
 
-SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+# xAI's current account flow starts in the Console; the Console then owns the
+# email verification/profile flow and redirects into the authenticated session.
+SIGNUP_URL = "https://console.x.ai/login?mode=sign-up"
 SIGNUP_NAVIGATION_ATTEMPTS = 3
 SIGNUP_NAVIGATION_TIMEOUT_MS = 45_000
 
@@ -169,6 +171,85 @@ def _native_click_action(keywords, deny_keywords=()) -> str:
             except Exception:
                 continue
     return ""
+
+
+def _click_email_form_submit() -> str:
+    """Click the Continue button belonging to the email form only.
+
+    The Console page also renders a prominent "Continue with Google" button;
+    a global text match is therefore unsafe after the email field is filled.
+    """
+    try:
+        result = page.run_js(
+            r"""
+function visible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden'
+        && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+}
+function labelOf(node) {
+    return [
+        node.innerText, node.textContent, node.getAttribute('aria-label'),
+        node.getAttribute('title'), node.getAttribute('data-testid'),
+        node.getAttribute('name'), node.getAttribute('type'),
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function isEmailInput(node) {
+    const meta = [
+        node.type, node.name, node.id, node.autocomplete,
+        node.placeholder, node.getAttribute('aria-label'),
+        node.getAttribute('data-testid'),
+    ].filter(Boolean).join(' ').toLowerCase();
+    return meta.includes('email') || meta.includes('e-mail') || meta.includes('mail');
+}
+const input = Array.from(document.querySelectorAll('input, textarea'))
+    .find((node) => visible(node) && !node.disabled && !node.readOnly && isEmailInput(node));
+if (!input || !(input.value || '').trim()) return '';
+
+const denied = (text) => /google|apple|github|microsoft|oauth|sso|sign in|log in|登录/i.test(text);
+const candidatesIn = (root) => Array.from(root.querySelectorAll(
+    'button[type="submit"], button, [role="button"], input[type="submit"], input[type="button"]'
+)).filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+
+const roots = [];
+if (input.form) roots.push(input.form);
+let parent = input.parentElement;
+for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+    roots.push(parent);
+}
+roots.push(document);
+
+let selected = null;
+let selectedScore = -1;
+for (const root of roots) {
+    for (const node of candidatesIn(root)) {
+        const text = labelOf(node);
+        const compact = text.replace(/\s+/g, '').toLowerCase();
+        if (denied(text)) continue;
+        let score = 0;
+        if (compact === 'continue') score = 1000;
+        else if (compact === 'next') score = 900;
+        else if (compact.includes('continuewithemail')) score = 980;
+        else if (compact.includes('signup') || compact.includes('createaccount')) score = 850;
+        else if (node.type === 'submit' || node.getAttribute('type') === 'submit') score = 700;
+        if (score > selectedScore) {
+            selected = node;
+            selectedScore = score;
+        }
+    }
+    if (selected && selectedScore >= 850) break;
+}
+if (!selected || selectedScore < 700) return '';
+selected.focus();
+selected.click();
+return labelOf(selected) || 'email-form-submit';
+            """
+        )
+        return str(result or "")
+    except Exception:
+        return ""
 
 
 def _native_type_element(element, value: str, per_char: bool = True) -> bool:
@@ -1130,25 +1211,13 @@ return candidates[0].text || true;
             continue
         sleep_with_cancel(0.8, cancel_callback)
         submit_clicked_at = time.time()
-        clicked = _native_click_action(
-            (
-                "注册", "继续", "下一步", "确认", "sign up", "signup", "continue", "next", "create account",
-                # 西班牙语
-                "registr", "finalizar", "continuar",
-                # 法语
-                "inscrire", "continuer",
-                # 德语
-                "registrieren", "weiter",
-                # 葡萄牙语
-                "inscrever", "continuar",
-                # 意大利语
-                "registrati", "continua",
-                # 日语
-                "登録",
-            ),
-        )
+        clicked = _click_email_form_submit()
         if not clicked:
             submit_clicked_at = time.time()
+            # Retry the scoped form lookup once; never fall back to a global
+            # "Continue" match because that can click Google sign-in.
+            clicked = _click_email_form_submit()
+        if False and not clicked:
             clicked = page.run_js(
                 r"""
 function isVisible(node) {
@@ -2023,7 +2092,9 @@ for (const selector of selectors) {
 // 已注册结果页没有 data-testid；稳定结构是：标题说明块 + 唯一邮件登录按钮，
 // 且卡片内没有任何可见输入框。邮件图标 class 不随页面语言变化。
 let signature = { matched: false, name: '', text: '' };
-if (/\/sign-up(?:[/?#]|$)/i.test(location.pathname + location.search)) {
+        if (/\/sign-up(?:[/?#]|$)/i.test(location.pathname + location.search)
+            || (/\/login(?:[/?#]|$)/i.test(location.pathname)
+                && /(?:^|&)mode=sign-up(?:&|$)/i.test(location.search.slice(1)))) {
   const headings = Array.from(document.querySelectorAll('h1')).filter(isVisible);
   for (const heading of headings) {
     const headingBlock = heading.parentElement;
@@ -2258,7 +2329,11 @@ return true;
             now = time.time()
             elapsed = now - started
             cur_url = _current_url()
-            on_accounts = ("accounts.x.ai" in cur_url) or ("auth.x.ai" in cur_url)
+            on_accounts = (
+                ("accounts.x.ai" in cur_url)
+                or ("auth.x.ai" in cur_url)
+                or ("console.x.ai" in cur_url)
+            )
             on_grok = "grok.com" in cur_url
 
             registered_notice = detect_account_already_registered()
@@ -2291,7 +2366,7 @@ return true;
                     last_signin_log = now
                     remain_hold = max(int(accounts_hold_seconds - elapsed), 0)
                     log_callback(
-                        f"[*] 页面显示正在登录，先在 accounts.x.ai 等待 sso"
+                        f"[*] 页面显示正在登录，先在 xAI 登录页等待 sso"
                         f"（再等 {remain_hold}s 后可跳 grok.com）..."
                     )
                 # hold 过半后再点「继续」，避免过早打断
@@ -2307,7 +2382,7 @@ return true;
                 if now - last_continue_click >= 5:
                     last_continue_click = now
                     if _click_continue_if_any() and log_callback:
-                        log_callback("[*] accounts 等待结束，已点击继续/前往类按钮...")
+                        log_callback("[*] xAI 登录页等待结束，已点击继续/前往类按钮...")
                         sleep_with_cancel(1.2, cancel_callback)
                         sso_val, names = _read_sso_from_cookies()
                         last_seen_names |= names
@@ -2320,7 +2395,7 @@ return true;
                     and now - last_grok_nudge >= 8
                     and (signin_hint or elapsed >= accounts_hold_seconds + 2)
                 ):
-                    sso_val = _nudge_grok_once("accounts 等待结束仍无 sso")
+                    sso_val = _nudge_grok_once("xAI 登录页等待结束仍无 sso")
                     if sso_val:
                         if log_callback:
                             log_callback("[*] 已获取到 sso cookie")

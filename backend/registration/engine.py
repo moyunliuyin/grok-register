@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 from curl_cffi import requests
+import requests as _stdlib_requests
 
 # 授权交换和导出逻辑集中在 integrations 包，编排层只负责调用。
 from backend.integrations import auth_exchange as _s2cpa
@@ -43,9 +44,20 @@ from backend.mailbox.utilities import pick_list_payload as _pick_list
 
 from backend.automation import session as _bs
 from backend.registration import signup_flow as _rf
+from backend.registration.workspace import (
+    WorkspaceSetupCancelled,
+    setup_workspace,
+)
 from backend.integrations import network_checks as _conn
 from backend.registration.store import RegistrationRepository
-from backend.integrations.proxy import redact_proxy_text, redact_proxy_url, resolve_proxy_url
+from backend.integrations.proxy import (
+    normalize_proxy_pool,
+    redact_proxy_text,
+    redact_proxy_url,
+    resolve_proxy_url,
+)
+from backend.integrations.proxy_chain import ProxyChainBridge
+from backend.integrations.proxy_gateway import ProxyGatewayClient
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT
 from backend.automation.session import (
     browser,
@@ -97,6 +109,46 @@ _repository = None
 _repository_lock = threading.Lock()
 _network_route_log_lock = threading.Lock()
 _network_route_log_keys = set()
+_proxy_tls = threading.local()
+
+
+class ProxyPool:
+    """Thread-safe round-robin proxy selector for registration accounts."""
+
+    def __init__(self, entries=()):
+        self._lock = threading.Lock()
+        self._entries = tuple(entries)
+        self._next_index = 0
+
+    def configure(self, entries) -> tuple[str, ...]:
+        normalized = tuple(str(item).strip() for item in entries if str(item).strip())
+        with self._lock:
+            if normalized != self._entries:
+                self._entries = normalized
+                self._next_index = 0
+            return self._entries
+
+    def snapshot(self) -> tuple[str, ...]:
+        with self._lock:
+            return self._entries
+
+    def peek(self) -> str:
+        with self._lock:
+            if not self._entries:
+                return ""
+            return self._entries[self._next_index % len(self._entries)]
+
+    def acquire(self) -> tuple[str, int, int]:
+        with self._lock:
+            if not self._entries:
+                return "", 0, 0
+            position = self._next_index % len(self._entries)
+            self._next_index += 1
+            return self._entries[position], position + 1, len(self._entries)
+
+
+_proxy_pool = ProxyPool()
+_proxy_pool_error_source = None
 
 
 def current_exception_traceback(max_chars=TRACEBACK_MAX_CHARS):
@@ -327,6 +379,15 @@ DEFAULT_CONFIG = {
     "outlookemail_pick_mode": "random",
     "outlookemail_disable_after_cpa_success": False,
     "proxy": "http://127.0.0.1:7890",
+    "proxy_pool": "",
+    "proxy_chain_via_local": True,
+    "proxy_gateway_enabled": False,
+    "proxy_gateway_panel_url": "",
+    "proxy_gateway_panel_password": "",
+    "proxy_gateway_proxy_url": "",
+    "workspace_auto_create": False,
+    "workspace_name": "My xAI Team",
+    "workspace_explore_pause_seconds": 5,
     "enable_nsfw": True,
     "debug_mode": False,
     "browser_engine": _bs.normalize_browser_engine(
@@ -757,6 +818,8 @@ def persist_registration_result(
         extra_data["cpa_mode"] = str(detail.get("mode"))
     if isinstance(detail.get("sso_risk_check"), dict):
         extra_data["sso_risk_check"] = dict(detail["sso_risk_check"])
+    if detail.get("workspace") is not None:
+        extra_data["workspace"] = dict(detail.get("workspace") or {})
     # Sub2API 摘要结果放入 extra，便于后续详情页展示
     if detail.get("sub2api_remote_result") is not None:
         extra_data["sub2api_remote_result"] = detail.get("sub2api_remote_result")
@@ -900,8 +963,147 @@ EXTENSION_PATH = ""
 DUCKMAIL_API_BASE_DEFAULT = duckmail_provider.API_BASE_DEFAULT
 
 
+def _sync_proxy_pool() -> tuple[str, ...]:
+    """Refresh the pool from config without exposing credentials in errors."""
+    global _proxy_pool_error_source
+    raw = str(config.get("proxy_pool", "") or "")
+    try:
+        normalized = normalize_proxy_pool(raw)
+    except ValueError as exc:
+        if raw != _proxy_pool_error_source:
+            _proxy_pool_error_source = raw
+            registration_log(f"[代理池] 配置无效，已回退 proxy: {exc}")
+        return _proxy_pool.configure(())
+    _proxy_pool_error_source = None
+    return _proxy_pool.configure(normalized.splitlines())
+
+
+def _proxy_gateway_enabled() -> bool:
+    return bool(config.get("proxy_gateway_enabled"))
+
+
+def _proxy_gateway_client() -> ProxyGatewayClient | None:
+    if not _proxy_gateway_enabled():
+        return None
+    return ProxyGatewayClient(
+        config.get("proxy_gateway_panel_url", ""),
+        config.get("proxy_gateway_panel_password", ""),
+        config.get("proxy_gateway_proxy_url", ""),
+    )
+
+
+def _proxy_pool_peek_upstream() -> str:
+    entries = _sync_proxy_pool()
+    return resolve_proxy_url(_proxy_pool.peek()) if entries else ""
+
+
+def _replace_gateway_preflight_upstream() -> str:
+    upstream = _proxy_pool_peek_upstream()
+    client = _proxy_gateway_client()
+    if client is not None and upstream:
+        exit_ip = client.replace_upstream(upstream)
+        if exit_ip:
+            registration_log(f"[代理网关] 预检已切换当前上游，出口 IP {exit_ip}")
+    return upstream
+
+
+def current_account_proxy() -> str:
+    """Return the sticky proxy for this thread, or the next configured value."""
+    if hasattr(_proxy_tls, "proxy"):
+        return str(getattr(_proxy_tls, "proxy") or "")
+    entries = _sync_proxy_pool()
+    if entries:
+        proxy = _proxy_pool.peek()
+    else:
+        gateway = _proxy_gateway_client()
+        proxy = gateway.proxy_url if gateway is not None else config.get("proxy", "")
+    return resolve_proxy_url(proxy)
+
+
+def begin_account_proxy(log_callback=None) -> str:
+    """Select and bind one proxy to the current account attempt/thread."""
+    entries = _sync_proxy_pool()
+    if entries:
+        raw_proxy, position, total = _proxy_pool.acquire()
+        upstream_proxy = resolve_proxy_url(raw_proxy)
+        proxy = upstream_proxy
+        bridge = None
+        gateway = _proxy_gateway_client()
+        if gateway is not None:
+            exit_ip = gateway.replace_upstream(upstream_proxy)
+            proxy = gateway.proxy_url
+            _proxy_tls.gateway = gateway
+            if log_callback:
+                suffix = f"，出口 IP {exit_ip}" if exit_ip else ""
+                log_callback(
+                    f"[代理网关] 已切换第 {position}/{total} 个上游: "
+                    f"{redact_proxy_url(upstream_proxy)}{suffix}"
+                )
+        elif bool(config.get("proxy_chain_via_local", True)):
+            first_hop = resolve_proxy_url(config.get("proxy", ""))
+            if first_hop:
+                bridge = ProxyChainBridge(first_hop, upstream_proxy)
+                proxy = bridge.start()
+        _proxy_tls.bridge = bridge
+        _proxy_tls.upstream_proxy = upstream_proxy
+        _proxy_tls.pool_position = (position, total)
+        if log_callback:
+            log_callback(
+                f"[代理池] 当前账号使用第 {position}/{total} 个代理: "
+                f"{redact_proxy_url(upstream_proxy)}"
+                + (
+                    f"（链路: {redact_proxy_url(first_hop)} -> 本地桥接 -> 池节点；本账号固定）"
+                    if bridge
+                    else "（本账号固定）"
+                )
+            )
+    else:
+        gateway = _proxy_gateway_client()
+        proxy = gateway.proxy_url if gateway is not None else resolve_proxy_url(config.get("proxy", ""))
+        _proxy_tls.bridge = None
+        _proxy_tls.upstream_proxy = proxy
+        _proxy_tls.pool_position = None
+        if log_callback and proxy:
+            log_callback(f"[代理] 当前账号使用: {redact_proxy_url(proxy)}")
+    _proxy_tls.proxy = proxy
+    return proxy
+
+
+def end_account_proxy() -> None:
+    """Release the current thread's account binding before the next attempt."""
+    bridge = getattr(_proxy_tls, "bridge", None)
+    if bridge is not None:
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+    for name in ("proxy", "pool_position"):
+        try:
+            delattr(_proxy_tls, name)
+        except AttributeError:
+            pass
+    for name in ("bridge", "upstream_proxy"):
+        try:
+            delattr(_proxy_tls, name)
+        except AttributeError:
+            pass
+    try:
+        delattr(_proxy_tls, "gateway")
+    except AttributeError:
+        pass
+
+
+def advance_proxy_pool() -> bool:
+    """Consume one pool slot so the next preflight/account uses the next proxy."""
+    entries = _sync_proxy_pool()
+    if not entries:
+        return False
+    _proxy_pool.acquire()
+    return True
+
+
 def get_proxies():
-    proxy = resolve_proxy_url(config.get("proxy", ""))
+    proxy = current_account_proxy()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
@@ -1425,8 +1627,8 @@ def _normalize_sso_token(raw_token):
 
 
 def _resolve_cpa_proxy():
-    """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，否则直连。"""
-    proxy = resolve_proxy_url(config.get("proxy", ""))
+    """CPA 换 token 用当前账号代理，其次回退 proxy/环境变量。"""
+    proxy = current_account_proxy()
     if proxy:
         return proxy
     for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
@@ -1720,7 +1922,11 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
             "device_browser": "浏览器 Device Flow",
             "auth_code": "Authorization Code",
         }
-        _cpa_log(f"SSO → {_mode_labels.get(token_mode, token_mode)} 换 token (proxy={proxy}) ...")
+        _cpa_log(
+            "SSO → "
+            f"{_mode_labels.get(token_mode, token_mode)} 换 token "
+            f"(proxy={redact_proxy_url(proxy)}) ..."
+        )
 
         def _browser_approve(user_code, open_url):
             return authorize_device_in_browser(
@@ -2007,6 +2213,8 @@ def _build_request_kwargs(**kwargs):
 
 def _http_request(method, url, **kwargs):
     kwargs.pop("_allow_direct_fallback", None)
+    if _is_mailnest_url(url) or _is_cpa_management_url(url):
+        return _standard_http_request(method, url, **kwargs)
     with direct_http_session() as session:
         return session.request(method, url, **_build_request_kwargs(**kwargs))
 
@@ -2021,6 +2229,48 @@ def http_post(url, **kwargs):
 
 def http_delete(url, **kwargs):
     return _http_request("DELETE", url, **kwargs)
+
+
+def _is_mailnest_url(url):
+    try:
+        return (urlsplit(str(url)).hostname or "").lower() == "mailnest.top"
+    except ValueError:
+        return False
+
+
+def _is_cpa_management_url(url):
+    try:
+        requested = urlsplit(str(url))
+        configured = urlsplit(str(config.get("cpa_remote_url", "") or ""))
+        return bool(
+            requested.hostname
+            and configured.hostname
+            and requested.hostname.lower() == configured.hostname.lower()
+            and (requested.path or "").startswith("/v0/management/")
+        )
+    except ValueError:
+        return False
+
+
+def _standard_http_request(method, url, **kwargs):
+    """MailNest 使用标准 requests，并保留系统代理环境。"""
+    request_kwargs = dict(kwargs)
+    request_kwargs.pop("impersonate", None)
+    request_kwargs.pop("_allow_direct_fallback", None)
+    proxies = request_kwargs.get("proxies")
+    if not proxies and _is_mailnest_url(url):
+        # MailNest 与浏览器使用同一出口；未显式传 proxies 时复用当前账号代理。
+        # CPA Management API 仍保持直连，避免影响已有远程上传链路。
+        proxies = get_proxies()
+        request_kwargs["proxies"] = proxies
+    _log_actual_http_route(
+        method,
+        url,
+        proxies=proxies,
+        proxy=request_kwargs.get("proxy", ""),
+    )
+    with _stdlib_requests.Session() as session:
+        return session.request(method, url, **_build_request_kwargs(**request_kwargs))
 
 
 def direct_http_session():
@@ -2714,7 +2964,35 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                     )
                 except Exception:
                     pass
-        page_obj.get("https://grok.com/")
+        try:
+            page_obj.get("https://grok.com/")
+        except Exception as nav_exc:
+            # accounts.x.ai -> grok.com 的重定向可能在 Chromium/CloakBrowser
+            # 中以 ERR_ABORTED 结束 goto，但页面实际上已经落到目标域。
+            # 这种情况不能直接判定 NSFW 失败；先读取当前 URL，必要时用
+            # commit 级别再导航一次，再继续等待 Cloudflare/页面脚本。
+            nav_text = str(nav_exc)
+            current_url = str(getattr(page_obj, "url", "") or "")
+            if "ERR_ABORTED" not in nav_text:
+                raise
+            if "grok.com" not in current_url:
+                try:
+                    page_obj.get(
+                        "https://grok.com/",
+                        wait_until="commit",
+                        timeout=30_000,
+                    )
+                    current_url = str(getattr(page_obj, "url", "") or "")
+                except Exception as retry_exc:
+                    current_url = str(getattr(page_obj, "url", "") or "")
+                    if "grok.com" not in current_url:
+                        raise nav_exc from retry_exc
+            if "grok.com" not in current_url:
+                raise
+            if log_callback:
+                log_callback(
+                    "[Debug] grok.com 导航收到 ERR_ABORTED，但当前页面已在目标域，继续 NSFW 流程"
+                )
         try:
             page_obj.wait.doc_loaded()
         except Exception:
@@ -3003,6 +3281,66 @@ def registration_log(message):
     print(line, flush=True)
 
 
+def _workspace_detail(status="disabled", error=""):
+    return {
+        "status": status,
+        "team_id": "",
+        "workspace_name": str(config.get("workspace_name") or "My xAI Team").strip()
+        or "My xAI Team",
+        "url": "",
+        "error": error,
+    }
+
+
+def _setup_workspace_for_registration(sso_token, log_callback, cancel_callback=None):
+    if not config.get("workspace_auto_create", False):
+        return _workspace_detail()
+    raise_if_cancelled(cancel_callback)
+    name = str(config.get("workspace_name") or "My xAI Team").strip() or "My xAI Team"
+    try:
+        page_obj = refresh_active_page()
+        result = setup_workspace(
+            page_obj,
+            name,
+            sso_token=sso_token,
+            timeout=60,
+            explore_pause_seconds=config.get("workspace_explore_pause_seconds", 5),
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    except WorkspaceSetupCancelled as exc:
+        raise RegistrationCancelled(str(exc)) from exc
+    except Exception as exc:
+        result = _workspace_detail("failed", f"workspace 设置异常: {exc}")
+    if not isinstance(result, dict):
+        result = _workspace_detail("failed", "workspace 设置返回结果无效")
+    result.setdefault("status", "failed")
+    result.setdefault("team_id", "")
+    result.setdefault("workspace_name", name)
+    result.setdefault("url", "")
+    result.setdefault("error", "")
+    status = str(result.get("status") or "failed")
+    team_id = str(result.get("team_id") or "")
+    if log_callback:
+        suffix = f"，team_id={team_id}" if team_id else ""
+        log_callback(f"[workspace] {status}{suffix}")
+        if status == "failed" and result.get("error"):
+            log_callback(f"[workspace] 失败但继续注册: {result['error']}")
+    return result
+
+
+def _require_workspace_ready(detail):
+    """Do not enter OAuth/NSFW until the Console confirms a workspace ID."""
+    if not config.get("workspace_auto_create", False):
+        return
+    workspace = dict(detail or {})
+    status = str(workspace.get("status") or "failed").strip().lower()
+    team_id = str(workspace.get("team_id") or "").strip()
+    if status not in {"created", "already_configured"} or not team_id:
+        error = str(workspace.get("error") or "Workspace 创建结果未确认")
+        raise RuntimeError(f"Workspace 未确认，已停止后续 OAuth/NSFW/CPA: {error}")
+
+
 def run_registration(count):
     controller = RegistrationStopController()
     reset_network_route_logs()
@@ -3045,12 +3383,60 @@ def run_registration(count):
         _cleanup_stale_profiles(log_callback=registration_log)
     except Exception:
         pass
+    # 代理池要求每个账号从当前领取的代理创建新浏览器；不要复用上一次
+    # 调试/任务保留的浏览器，否则首个账号可能仍沿用旧出口。
     try:
-        startup_checks = _conn.run_connectivity_checks(config, http_get, http_post)
-        for name, ok, detail in startup_checks:
-            registration_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
+        if _sync_proxy_pool() and active_browser() is not None:
+            stop_browser(force=True)
+    except Exception:
+        pass
+    try:
+        pool_entries = _sync_proxy_pool()
+        # 预检失败时轮换代理池；成功的 peek 位置会被第一个账号正式领取。
+        preflight_attempts = min(len(pool_entries), 5) if pool_entries else 1
+        startup_checks = []
+        for preflight_index in range(preflight_attempts):
+            startup_config = dict(config)
+            preflight_bridge = None
+            try:
+                selected_proxy = current_account_proxy()
+                startup_proxy = selected_proxy
+                gateway_probe = _proxy_gateway_client()
+                if gateway_probe is not None and selected_proxy:
+                    exit_ip = gateway_probe.replace_upstream(selected_proxy)
+                    startup_proxy = gateway_probe.proxy_url
+                    if exit_ip:
+                        registration_log(f"[代理网关] 预检已切换上游，出口 IP {exit_ip}")
+                else:
+                    first_hop = resolve_proxy_url(config.get("proxy", ""))
+                if (
+                    gateway_probe is None
+                    and pool_entries
+                    and bool(config.get("proxy_chain_via_local", True))
+                    and first_hop
+                ):
+                    preflight_bridge = ProxyChainBridge(first_hop, selected_proxy)
+                    startup_proxy = preflight_bridge.start()
+                startup_config["proxy"] = startup_proxy
+                startup_checks = _conn.run_connectivity_checks(
+                    startup_config, http_get, http_post
+                )
+            finally:
+                if preflight_bridge is not None:
+                    preflight_bridge.stop()
+            for name, ok, detail in startup_checks:
+                registration_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
+            if not _conn.has_blocking_xai_failure(startup_checks):
+                break
+            if preflight_index + 1 < preflight_attempts:
+                failed_proxy = current_account_proxy()
+                advance_proxy_pool()
+                registration_log(
+                    "[代理池] xAI 预检失败，跳过当前代理并轮换: "
+                    f"{redact_proxy_url(failed_proxy)}"
+                )
         if _conn.has_blocking_xai_failure(startup_checks):
-            registration_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+            registration_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换代理池或重试")
             return
     except Exception as exc:
         registration_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
@@ -3124,35 +3510,12 @@ def run_registration(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             try:
-                boot_started_at = time.time()
-                try:
-                    start_browser(
-                        log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                        cancel_callback=controller.should_stop,
-                    )
-                except Exception as boot_exc:
-                    if controller.should_stop():
-                        registration_log(f"[W{wid+1}] [!] 已停止，浏览器启动中断: {boot_exc}")
-                        return
-                    local_fail = n
-                    local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
-                    registration_log(f"[W{wid+1}] [-] 浏览器启动失败，{n} 个任务均记为失败: {boot_exc}")
-                    for _ in range(max(int(n or 0), 0)):
-                        _persist_result(
-                            started_at=boot_started_at,
-                            worker_id=wid,
-                            status="failure",
-                            failure_type=FAIL_BROWSER,
-                            failure_reason=str(boot_exc),
-                            cpa_detail={
-                                "enabled": bool(config.get("cpa_auto_add", False)),
-                                "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                            },
-                        )
-                    return
                 i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
+                    begin_account_proxy(
+                        log_callback=lambda m: registration_log(f"[W{wid+1}] {m}")
+                    )
                     attempt_started_at = time.time()
                     email = ""
                     profile = {}
@@ -3161,6 +3524,7 @@ def run_registration(count):
                     cpa_detail = {
                         "enabled": bool(config.get("cpa_auto_add", False)),
                         "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
+                        "workspace": _workspace_detail(),
                     }
                     nsfw_status = "未执行"
                     try:
@@ -3193,6 +3557,21 @@ def run_registration(count):
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             result_out=cpa_detail,
                         )
+                        cpa_detail["workspace"] = _setup_workspace_for_registration(
+                            sso,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        _require_workspace_ready(cpa_detail["workspace"])
+                        # Complete the CPA browser OAuth while the active page
+                        # is still on xAI. NSFW below intentionally navigates
+                        # to grok.com and must not come first.
+                        cpa_ok = add_sso_to_cpa(
+                            sso,
+                            email=email,
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                            result_out=cpa_detail,
+                        )
                         if config.get("enable_nsfw", True):
                             nsfw_ok, nsfw_msg = enable_nsfw_for_token(
                                 sso,
@@ -3218,12 +3597,6 @@ def run_registration(count):
                                 log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                        cpa_ok = add_sso_to_cpa(
-                            sso,
-                            email=email,
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            result_out=cpa_detail,
-                        )
                         if not registration_counts_as_success(cpa_detail):
                             reason = cpa_failure_reason(cpa_detail)
                             local_fail_stats[FAIL_CPA] = local_fail_stats.get(FAIL_CPA, 0) + 1
@@ -3388,7 +3761,9 @@ def run_registration(count):
                                 time.sleep(0.3)
                             except Exception:
                                 pass
+                        end_account_proxy()
             finally:
+                end_account_proxy()
                 try:
                     maybe_stop_browser(
                         user_stopped=bool(controller.should_stop()),
@@ -3420,33 +3795,11 @@ def run_registration(count):
         return
 
     try:
-        boot_started_at = time.time()
-        try:
-            start_browser(log_callback=registration_log, cancel_callback=controller.should_stop)
-        except Exception as boot_exc:
-            if controller.should_stop():
-                registration_log(f"[!] 已停止，浏览器启动中断: {boot_exc}")
-                return
-            fail_count += count
-            fail_stats[FAIL_BROWSER] = fail_stats.get(FAIL_BROWSER, 0) + count
-            registration_log(f"[-] 浏览器启动失败，{count} 个任务均记为失败: {boot_exc}")
-            for _ in range(max(int(count or 0), 0)):
-                _persist_result(
-                    started_at=boot_started_at,
-                    status="failure",
-                    failure_type=FAIL_BROWSER,
-                    failure_reason=str(boot_exc),
-                    cpa_detail={
-                        "enabled": bool(config.get("cpa_auto_add", False)),
-                        "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                    },
-                )
-            return
-        registration_log("[*] 浏览器已启动")
         i = 0
         while i < count:
             if controller.should_stop():
                 break
+            begin_account_proxy(log_callback=registration_log)
             registration_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             attempt_started_at = time.time()
             email = ""
@@ -3456,6 +3809,7 @@ def run_registration(count):
             cpa_detail = {
                 "enabled": bool(config.get("cpa_auto_add", False)),
                 "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
+                "workspace": _workspace_detail(),
             }
             nsfw_status = "未执行"
             try:
@@ -3531,6 +3885,19 @@ def run_registration(count):
                     log_callback=registration_log,
                     result_out=cpa_detail,
                 )
+                cpa_detail["workspace"] = _setup_workspace_for_registration(
+                    sso,
+                    log_callback=registration_log,
+                    cancel_callback=controller.should_stop,
+                )
+                _require_workspace_ready(cpa_detail["workspace"])
+                # Complete CPA browser OAuth on xAI before NSFW navigates to Grok.
+                cpa_ok = add_sso_to_cpa(
+                    sso,
+                    email=email,
+                    log_callback=registration_log,
+                    result_out=cpa_detail,
+                )
                 if config.get("enable_nsfw", True):
                     registration_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3554,12 +3921,6 @@ def run_registration(count):
                     registration_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=registration_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(
-                    sso,
-                    email=email,
-                    log_callback=registration_log,
-                    result_out=cpa_detail,
-                )
                 counted_success = False
                 if not registration_counts_as_success(cpa_detail):
                     reason = cpa_failure_reason(cpa_detail)
@@ -3719,6 +4080,7 @@ def run_registration(count):
                 )
                 registration_log(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             finally:
+                end_account_proxy()
                 if controller.should_stop():
                     break
                 # 每轮结束只关浏览器，不立刻再开。

@@ -222,6 +222,11 @@ Windows 启动：
 | `register_count` | 注册数量 |
 | `register_workers` | 并发数量，默认 1 |
 | `proxy` | 注册和 OAuth 请求使用的 HTTP(S) 代理；支持 `http://host:port` 和 `http://user:password@host:port`，凭据中的特殊字符需使用 URL 百分号编码。注册风控会记录浏览器识别到的出口 IP；下次若仍是该 IP，会重启浏览器换出口后再注册。风控名单在「账号中心 → 出口 IP 风控」查看，单账号出口 IP 在「账号中心 → 账号管理 → 查看」详情中 |
+| `proxy_pool` | 代理池，多行或空白分隔；支持完整 HTTP(S) URL 和 `host:port:user:password` 裸格式。按账号轮换，当前账号及重试期间固定；配置无效时回退 `proxy` |
+| `proxy_chain_via_local` | 代理池链路开关；开启后按“本机 `proxy` → 当前代理池节点 → 目标站点”建立账号级 CONNECT 链路，默认开启 |
+| `proxy_gateway_enabled` | 动态代理网关开关；启用后每个账号先调用网关切换 `proxy_pool` 上游，再使用网关代理入口出网 |
+| `workspace_auto_create` | 注册成功后是否自动进入 xAI Console 创建 Workspace/Team；默认关闭，失败不会影响账号保存 |
+| `workspace_name` | 自动创建的 Workspace/Team 名称，默认 `My xAI Team` |
 | `browser_engine` | 浏览器后端：`camoufox`（默认）或 `cloakbrowser` |
 | `browser_headless` | 本机无头模式；Docker 中强制关闭 |
 | `browser_low_traffic_mode` | 低流量模式，默认开启；注册和重新登录共用静态资源缓存并跳过非必需资源。设置页可查看当前缓存并一键清空；清空后下次打开注册页或重新登录页会自动重新下载 |

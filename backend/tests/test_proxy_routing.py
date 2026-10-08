@@ -1,4 +1,5 @@
 import base64
+from collections import Counter
 import socketserver
 import threading
 import unittest
@@ -13,6 +14,7 @@ from backend.registration import engine as gr
 class ProxyRoutingTests(unittest.TestCase):
     def setUp(self):
         self.original_config = dict(gr.config)
+        gr.config["proxy_gateway_enabled"] = False
 
     def tearDown(self):
         gr.config.clear()
@@ -36,6 +38,77 @@ class ProxyRoutingTests(unittest.TestCase):
         )
         options = browser_session.create_browser_options(unique_profile=False)
         self.assertEqual(options["proxy"], {"server": "http://127.0.0.1:7897"})
+
+    def test_proxy_pool_rotates_thread_safely(self):
+        pool = gr.ProxyPool(("http://proxy-a.example.com:8080", "http://proxy-b.example.com:8080"))
+        values = []
+        values_lock = threading.Lock()
+
+        def acquire():
+            value, _, _ = pool.acquire()
+            with values_lock:
+                values.append(value)
+
+        threads = [threading.Thread(target=acquire) for _ in range(32)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(values), 32)
+        self.assertEqual(Counter(values), Counter({
+            "http://proxy-a.example.com:8080": 16,
+            "http://proxy-b.example.com:8080": 16,
+        }))
+
+    def test_advance_proxy_pool_moves_preflight_peek(self):
+        gr.config["proxy_pool"] = (
+            "proxy-a.example.com:8080:user:pass\n"
+            "proxy-b.example.com:8080:user:pass"
+        )
+        first = gr.current_account_proxy()
+        self.assertTrue(gr.advance_proxy_pool())
+        second = gr.current_account_proxy()
+        self.assertNotEqual(first, second)
+
+    def test_account_proxy_is_sticky_and_rotates_after_release(self):
+        gr.config["proxy_pool"] = (
+            "proxy-a.example.com:8080:user:pass\n"
+            "proxy-b.example.com:8080:user:pass"
+        )
+        logs = []
+        first = gr.begin_account_proxy(log_callback=logs.append)
+        self.assertEqual(gr.get_proxies(), {"http": first, "https": first})
+        self.assertEqual(gr.current_account_proxy(), first)
+        gr.end_account_proxy()
+        second = gr.begin_account_proxy(log_callback=logs.append)
+        self.assertNotEqual(first, second)
+        self.assertEqual(gr.get_proxies(), {"http": second, "https": second})
+        self.assertNotIn("user:pass", "\n".join(logs))
+        gr.end_account_proxy()
+
+    def test_browser_reads_current_account_proxy_from_pool(self):
+        gr.config["proxy_pool"] = "proxy-a.example.com:8080:user:pass"
+        gr.config["proxy_chain_via_local"] = False
+        selected = gr.begin_account_proxy()
+        try:
+            browser_session.configure(
+                get_proxies=gr.get_proxies,
+                is_debug=lambda: False,
+                is_headless=lambda: False,
+                get_locale=lambda: "en-US",
+            )
+            options = browser_session.create_browser_options(unique_profile=False)
+        finally:
+            gr.end_account_proxy()
+        self.assertEqual(
+            options["proxy"],
+            {
+                "server": "http://proxy-a.example.com:8080",
+                "username": "user",
+                "password": "pass",
+            },
+        )
 
     def test_camoufox_registration_uses_authenticated_http_proxy(self):
         browser_session.configure(
@@ -217,6 +290,39 @@ class ProxyRoutingTests(unittest.TestCase):
                     timeout=15,
                 )
 
+    def test_mailnest_uses_standard_requests_client(self):
+        response = mock.Mock(status_code=200)
+        session = mock.MagicMock()
+        session.__enter__.return_value = session
+        session.__exit__.return_value = False
+        session.request.return_value = response
+        with mock.patch.object(
+            gr._stdlib_requests, "Session", return_value=session
+        ) as factory, mock.patch.object(
+            gr, "get_proxies", return_value={
+                "http": "http://127.0.0.1:7890",
+                "https": "http://127.0.0.1:7890",
+            }
+        ):
+            result = gr.http_get(
+                "https://mailnest.top/",
+                headers={"Accept": "application/json"},
+                timeout=12,
+            )
+        self.assertIs(result, response)
+        factory.assert_called_once_with()
+        self.assertTrue(session.trust_env)
+        session.request.assert_called_once_with(
+            "GET",
+            "https://mailnest.top/",
+            headers={"Accept": "application/json"},
+            proxies={
+                "http": "http://127.0.0.1:7890",
+                "https": "http://127.0.0.1:7890",
+            },
+            timeout=12,
+        )
+
     def test_xai_connectivity_check_explicitly_uses_configured_proxy(self):
         response = mock.Mock(status_code=200, text="<!doctype html>", headers={})
         http_get = mock.Mock(return_value=response)
@@ -279,6 +385,7 @@ class ProxyRoutingTests(unittest.TestCase):
             {
                 "proxy": proxy,
                 "cpa_auto_add": True,
+                "proxy_pool": "",
                 "cpa_token_mode": "device_protocol",
                 "cpa_auth_dir": "",
                 "cpa_remote_url": "http://cpa.internal:8317",
@@ -328,7 +435,7 @@ class ProxyRoutingTests(unittest.TestCase):
         session.__enter__.return_value = session
         session.__exit__.return_value = False
         session.post.return_value = response
-        with mock.patch.object(auth_exchange.requests, "Session", return_value=session) as factory:
+        with mock.patch.object(auth_exchange._stdlib_requests, "Session", return_value=session) as factory:
             name = auth_exchange.upload_cpa_auth_remote(
                 "http://cpa.internal:8317",
                 "management-key",
@@ -336,7 +443,7 @@ class ProxyRoutingTests(unittest.TestCase):
                 proxy="",
             )
         self.assertEqual(name, "xai-fixture@example.com.json")
-        factory.assert_called_once_with(trust_env=False)
+        factory.assert_called_once_with()
         self.assertIsNone(session.post.call_args.kwargs["proxies"])
 
 

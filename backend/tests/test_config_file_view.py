@@ -63,6 +63,27 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         self.assertIn("网络代理格式错误", str(raised.exception.detail))
         save.assert_not_called()
 
+    def test_proxy_pool_is_normalized_and_saved(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            result = _apply_config_updates(
+                {"proxy_pool": "proxy.example.com:8080:user:p@ss https://proxy-b.example.com:8443"}
+            )
+
+        expected = "http://user:p%40ss@proxy.example.com:8080\nhttps://proxy-b.example.com:8443"
+        self.assertEqual(gr.config["proxy_pool"], expected)
+        self.assertEqual(result["config"]["proxy_pool"], expected)
+        self.assertIn("proxy_pool", result["config"]["_sensitive_keys"])
+        save.assert_called_once_with()
+
+    def test_invalid_proxy_pool_is_rejected_before_saving(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            with self.assertRaises(HTTPException) as raised:
+                _apply_config_updates({"proxy_pool": "proxy.example.com:not-a-port:user:pass"})
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("代理池格式错误", str(raised.exception.detail))
+        save.assert_not_called()
+
     def test_sso_detailed_risk_switch_is_public_and_saved_as_boolean(self):
         with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
             result = _apply_config_updates({"sso_detailed_risk_check": True})
@@ -126,6 +147,18 @@ class ProxyConfigUpdateTests(unittest.TestCase):
 
         self.assertEqual(selected["config"]["browser_engine"], "cloakbrowser")
         self.assertEqual(fallback["config"]["browser_engine"], "camoufox")
+
+    def test_workspace_settings_are_public_and_saved(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            result = _apply_config_updates(
+                {"workspace_auto_create": True, "workspace_name": "Fixture Team"}
+            )
+
+        self.assertIs(gr.config["workspace_auto_create"], True)
+        self.assertEqual(gr.config["workspace_name"], "Fixture Team")
+        self.assertIs(result["config"]["workspace_auto_create"], True)
+        self.assertEqual(result["config"]["workspace_name"], "Fixture Team")
+        save.assert_called_once_with()
 
 
 if __name__ == "__main__":

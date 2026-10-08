@@ -28,6 +28,17 @@ class SignupFlowTests(unittest.TestCase):
         element = self.NativeInput(current_value="Neo")
         self.assertTrue(signup_flow._native_type_element(element, "Neo"))
 
+    def test_email_submit_is_scoped_to_email_form(self):
+        page = mock.Mock()
+        page.run_js.return_value = "Continue"
+
+        with mock.patch.object(signup_flow, "page", page):
+            self.assertEqual(signup_flow._click_email_form_submit(), "Continue")
+
+        script = page.run_js.call_args.args[0]
+        self.assertIn("input.form", script)
+        self.assertIn("google", script)
+
     def test_detects_account_already_registered_notice(self):
         page = mock.Mock()
         page.run_js.return_value = {
