@@ -350,7 +350,7 @@ def _select_explore_and_pause(page_obj, deadline, pause_seconds=0, log_callback=
     return bool(selection)
 
 
-def _finish_api_key_screen(page_obj, log_callback=None) -> bool:
+def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False) -> bool:
     """Leave the one-time API-key screen without copying the key."""
     deadline = time.monotonic() + 30.0
     get_started_done = False
@@ -358,9 +358,12 @@ def _finish_api_key_screen(page_obj, log_callback=None) -> bool:
     skip_for_now_done = False
     while time.monotonic() < deadline:
         # The Console home can already be mounted behind the onboarding
-        # overlay.  It must not be treated as complete until the key-flow
-        # actions and the final "Skip for now" action have both happened.
-        if skip_for_now_done and _console_dashboard_ready(page_obj):
+        # overlay.  Once the page has no visible plan/onboarding control and
+        # exposes the real Create API key action, it is safe to continue even
+        # when a product announcement modal covers the dashboard.  The
+        # dashboard detector explicitly rejects visible plan controls, so
+        # this does not reintroduce the old Continue/Skip false positive.
+        if _console_dashboard_ready(page_obj):
             if log_callback:
                 log_callback("[workspace] 检测到 Create API key，8s 后开始 CPA OAuth")
             time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
@@ -378,6 +381,13 @@ def _finish_api_key_screen(page_obj, log_callback=None) -> bool:
                             log_callback("[workspace] 已点击 Get started")
                         time.sleep(0.5)
                         continue
+                    if allow_direct_skip:
+                        skip_for_now_done = _click_skip_for_now(
+                            page_obj,
+                            log_callback=log_callback,
+                        )
+                        if skip_for_now_done:
+                            continue
                 elif not leave_anyway_done:
                     leave = raw_page.get_by_role("button", name="Leave anyway", exact=True).first
                     if leave.count() and leave.is_visible():
@@ -395,6 +405,22 @@ def _finish_api_key_screen(page_obj, log_callback=None) -> bool:
                     )
                     if skip_for_now_done:
                         continue
+            except Exception:
+                pass
+        if (
+            allow_direct_skip
+            and not get_started_done
+            and not leave_anyway_done
+            and not skip_for_now_done
+            and raw_page is None
+        ):
+            try:
+                skip_for_now_done = _click_skip_for_now(
+                    page_obj,
+                    log_callback=log_callback,
+                )
+                if skip_for_now_done:
+                    continue
             except Exception:
                 pass
         try:
@@ -485,7 +511,8 @@ const visible = (node) => {
     && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
 };
 const labels = controls.filter(visible).map(label);
-const hasApiKeyAction = labels.some((text) => /^(Create API key|API Keys)$/i.test(text));
+const normalizedLabels = labels.map((text) => text.replace(/^[^A-Za-z0-9]+/, '').trim());
+const hasApiKeyAction = normalizedLabels.some((text) => /^(Create API key|API Keys)$/i.test(text));
 const hasPlanControl = labels.some((text) => /^(Explore|Skip|Skip for now|Continue for free|Checkout|Get started|Leave anyway)$/i.test(text));
 return {
   ready: hasWelcome && hasDashboard && hasApiKeyAction && !hasPlanControl,
@@ -607,7 +634,11 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                 if _real_mouse_click_text(raw_page, "Continue for free"):
                     if log_callback:
                         log_callback("[workspace] 已用真实鼠标点击 Continue for free，未点击 Checkout")
-                    if _finish_api_key_screen(page_obj, log_callback=log_callback):
+                    if _finish_api_key_screen(
+                        page_obj,
+                        log_callback=log_callback,
+                        allow_direct_skip=True,
+                    ):
                         return True
                     if log_callback:
                         log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
@@ -623,7 +654,11 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                         )
                         if log_callback:
                             log_callback("[workspace] 已用真实鼠标点击 Continue for free，未点击 Checkout")
-                        if _finish_api_key_screen(page_obj, log_callback=log_callback):
+                        if _finish_api_key_screen(
+                            page_obj,
+                            log_callback=log_callback,
+                            allow_direct_skip=True,
+                        ):
                             return True
                         if log_callback:
                             log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
@@ -636,7 +671,11 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                     button.click(timeout=3000)
                     if log_callback:
                         log_callback("[workspace] 已点击 Continue for free，未点击 Checkout")
-                    if _finish_api_key_screen(page_obj, log_callback=log_callback):
+                    if _finish_api_key_screen(
+                        page_obj,
+                        log_callback=log_callback,
+                        allow_direct_skip=True,
+                    ):
                         return True
                     if log_callback:
                         log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
@@ -686,7 +725,11 @@ return true;
             if result:
                 if log_callback:
                     log_callback("[workspace] 已点击 Continue for free，未点击 Checkout")
-                if _finish_api_key_screen(page_obj, log_callback=log_callback):
+                if _finish_api_key_screen(
+                    page_obj,
+                    log_callback=log_callback,
+                    allow_direct_skip=True,
+                ):
                     return True
                 if log_callback:
                     log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")

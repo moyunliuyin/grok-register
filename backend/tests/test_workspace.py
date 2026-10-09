@@ -143,6 +143,40 @@ class WorkspaceSetupTests(unittest.TestCase):
 
         dashboard_ready.assert_not_called()
 
+    def test_direct_console_dashboard_allows_cpa_after_create_api_key(self):
+        page = WorkspacePage()
+        logs = []
+
+        with mock.patch.object(
+            workspace_module,
+            "_console_dashboard_ready",
+            return_value=True,
+        ), mock.patch.object(workspace_module.time, "sleep"):
+            result = workspace_module._finish_api_key_screen(page, logs.append)
+
+        self.assertTrue(result)
+        self.assertIn("Create API key", logs[-1])
+
+    def test_explore_route_can_click_direct_skip_for_now(self):
+        page = WorkspacePage()
+
+        with mock.patch.object(
+            workspace_module,
+            "_console_dashboard_ready",
+            side_effect=[False, True],
+        ), mock.patch.object(
+            workspace_module,
+            "_click_skip_for_now",
+            return_value=True,
+        ) as click_skip, mock.patch.object(workspace_module.time, "sleep"):
+            result = workspace_module._finish_api_key_screen(
+                page,
+                allow_direct_skip=True,
+            )
+
+        self.assertTrue(result)
+        click_skip.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
