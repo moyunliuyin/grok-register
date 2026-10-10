@@ -44,10 +44,6 @@ from backend.mailbox.utilities import pick_list_payload as _pick_list
 
 from backend.automation import session as _bs
 from backend.registration import signup_flow as _rf
-from backend.registration.workspace import (
-    WorkspaceSetupCancelled,
-    setup_workspace,
-)
 from backend.integrations import network_checks as _conn
 from backend.registration.store import RegistrationRepository
 from backend.integrations.proxy import (
@@ -385,9 +381,6 @@ DEFAULT_CONFIG = {
     "proxy_gateway_panel_url": "",
     "proxy_gateway_panel_password": "",
     "proxy_gateway_proxy_url": "",
-    "workspace_auto_create": False,
-    "workspace_name": "My xAI Team",
-    "workspace_explore_pause_seconds": 5,
     "enable_nsfw": True,
     "debug_mode": False,
     "browser_engine": _bs.normalize_browser_engine(
@@ -818,8 +811,6 @@ def persist_registration_result(
         extra_data["cpa_mode"] = str(detail.get("mode"))
     if isinstance(detail.get("sso_risk_check"), dict):
         extra_data["sso_risk_check"] = dict(detail["sso_risk_check"])
-    if detail.get("workspace") is not None:
-        extra_data["workspace"] = dict(detail.get("workspace") or {})
     # Sub2API 摘要结果放入 extra，便于后续详情页展示
     if detail.get("sub2api_remote_result") is not None:
         extra_data["sub2api_remote_result"] = detail.get("sub2api_remote_result")
@@ -3317,64 +3308,6 @@ def registration_log(message):
     print(line, flush=True)
 
 
-def _workspace_detail(status="disabled", error=""):
-    return {
-        "status": status,
-        "team_id": "",
-        "workspace_name": str(config.get("workspace_name") or "My xAI Team").strip()
-        or "My xAI Team",
-        "url": "",
-        "error": error,
-    }
-
-
-def _setup_workspace_for_registration(sso_token, log_callback, cancel_callback=None):
-    if not config.get("workspace_auto_create", False):
-        return _workspace_detail()
-    raise_if_cancelled(cancel_callback)
-    name = str(config.get("workspace_name") or "My xAI Team").strip() or "My xAI Team"
-    try:
-        page_obj = refresh_active_page()
-        result = setup_workspace(
-            page_obj,
-            name,
-            sso_token=sso_token,
-            timeout=60,
-            explore_pause_seconds=config.get("workspace_explore_pause_seconds", 5),
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-        )
-    except WorkspaceSetupCancelled as exc:
-        raise RegistrationCancelled(str(exc)) from exc
-    except Exception as exc:
-        result = _workspace_detail("failed", f"workspace 设置异常: {exc}")
-    if not isinstance(result, dict):
-        result = _workspace_detail("failed", "workspace 设置返回结果无效")
-    result.setdefault("status", "failed")
-    result.setdefault("team_id", "")
-    result.setdefault("workspace_name", name)
-    result.setdefault("url", "")
-    result.setdefault("error", "")
-    status = str(result.get("status") or "failed")
-    team_id = str(result.get("team_id") or "")
-    if log_callback:
-        suffix = f"，team_id={team_id}" if team_id else ""
-        log_callback(f"[workspace] {status}{suffix}")
-        if status == "failed" and result.get("error"):
-            log_callback(f"[workspace] 失败但继续注册: {result['error']}")
-    return result
-
-
-def _require_workspace_ready(detail):
-    """Do not enter OAuth/NSFW until the Console confirms a workspace ID."""
-    if not config.get("workspace_auto_create", False):
-        return
-    workspace = dict(detail or {})
-    status = str(workspace.get("status") or "failed").strip().lower()
-    team_id = str(workspace.get("team_id") or "").strip()
-    if status not in {"created", "already_configured"} or not team_id:
-        error = str(workspace.get("error") or "Workspace 创建结果未确认")
-        raise RuntimeError(f"Workspace 未确认，已停止后续 OAuth/NSFW/CPA: {error}")
 
 
 def run_registration(count):
@@ -3560,7 +3493,6 @@ def run_registration(count):
                     cpa_detail = {
                         "enabled": bool(config.get("cpa_auto_add", False)),
                         "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                        "workspace": _workspace_detail(),
                     }
                     nsfw_status = "未执行"
                     try:
@@ -3593,12 +3525,6 @@ def run_registration(count):
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
                             result_out=cpa_detail,
                         )
-                        cpa_detail["workspace"] = _setup_workspace_for_registration(
-                            sso,
-                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        _require_workspace_ready(cpa_detail["workspace"])
                         # Complete the CPA browser OAuth while the active page
                         # is still on xAI. NSFW below intentionally navigates
                         # to grok.com and must not come first.
@@ -3845,7 +3771,6 @@ def run_registration(count):
             cpa_detail = {
                 "enabled": bool(config.get("cpa_auto_add", False)),
                 "status": "not_attempted" if config.get("cpa_auto_add") else "disabled",
-                "workspace": _workspace_detail(),
             }
             nsfw_status = "未执行"
             try:
@@ -3921,12 +3846,6 @@ def run_registration(count):
                     log_callback=registration_log,
                     result_out=cpa_detail,
                 )
-                cpa_detail["workspace"] = _setup_workspace_for_registration(
-                    sso,
-                    log_callback=registration_log,
-                    cancel_callback=controller.should_stop,
-                )
-                _require_workspace_ready(cpa_detail["workspace"])
                 # Complete CPA browser OAuth on xAI before NSFW navigates to Grok.
                 cpa_ok = add_sso_to_cpa(
                     sso,

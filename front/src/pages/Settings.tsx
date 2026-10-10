@@ -858,21 +858,6 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 onCheckedChange={(value) => setField("enable_nsfw", value)}
               />
               <ToggleRow
-                title="注册后自动创建 Workspace"
-                description="进入 xAI Console 创建 Workspace/Team；失败时仍继续保存账号与 CPA"
-                checked={!!config.workspace_auto_create}
-                onCheckedChange={(value) => setField("workspace_auto_create", value)}
-              />
-              {config.workspace_auto_create ? (
-                <ConfigField
-                  {...fieldState}
-                  label="Workspace 名称"
-                  field="workspace_name"
-                  placeholder="My xAI Team"
-                  helper="创建 Workspace/Team 时填写的名称。"
-                />
-              ) : null}
-              <ToggleRow
                 title="调试模式"
                 description="强制单账号，结束后保留浏览器"
                 checked={!!config.debug_mode}

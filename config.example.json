@@ -31,8 +31,6 @@
   "proxy_gateway_panel_url": "",
   "proxy_gateway_panel_password": "",
   "proxy_gateway_proxy_url": "",
-  "workspace_auto_create": false,
-  "workspace_name": "My xAI Team",
   "enable_nsfw": true,
   "debug_mode": false,
   "browser_engine": "camoufox",

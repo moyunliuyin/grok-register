@@ -148,17 +148,6 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         self.assertEqual(selected["config"]["browser_engine"], "cloakbrowser")
         self.assertEqual(fallback["config"]["browser_engine"], "camoufox")
 
-    def test_workspace_settings_are_public_and_saved(self):
-        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
-            result = _apply_config_updates(
-                {"workspace_auto_create": True, "workspace_name": "Fixture Team"}
-            )
-
-        self.assertIs(gr.config["workspace_auto_create"], True)
-        self.assertEqual(gr.config["workspace_name"], "Fixture Team")
-        self.assertIs(result["config"]["workspace_auto_create"], True)
-        self.assertEqual(result["config"]["workspace_name"], "Fixture Team")
-        save.assert_called_once_with()
 
 
 if __name__ == "__main__":
