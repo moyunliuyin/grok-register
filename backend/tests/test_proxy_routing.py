@@ -429,6 +429,74 @@ class ProxyRoutingTests(unittest.TestCase):
         self.assertNotIn("p%40ss", rendered_logs)
         self.assertIn("proxy=http://***:***@127.0.0.1:7897", rendered_logs)
 
+    def test_device_browser_missing_referrer_retries_authorization_code(self):
+        gr.config.update(
+            {
+                "proxy": "",
+                "cpa_auto_add": True,
+                "cpa_token_mode": "device_browser",
+                "cpa_auth_dir": "",
+                "cpa_remote_url": "http://cpa.internal:8317",
+                "cpa_management_key": "management-key",
+                "grok2api_auth_dir": "",
+                "grok2api_remote_url": "",
+                "grok2api_remote_username": "",
+                "grok2api_remote_password": "",
+            }
+        )
+        device_token = {"access_token": "device", "refresh_token": "device-refresh"}
+        auth_code_token = {"access_token": "auth-code", "refresh_token": "auth-refresh"}
+        records = [
+            {"access_token": "device", "email": "fixture@example.com"},
+            {"access_token": "auth-code", "email": "fixture@example.com"},
+        ]
+        with mock.patch.object(
+            gr,
+            "_active_page",
+            return_value=object(),
+        ), mock.patch.object(
+            gr._s2cpa,
+            "sso_to_token",
+            side_effect=[device_token, auth_code_token],
+        ) as exchange, mock.patch.object(
+            gr._s2cpa,
+            "token_to_cpa_record",
+            side_effect=records,
+        ), mock.patch.object(
+            gr._s2cpa,
+            "decode_jwt_payload",
+            side_effect=[
+                {"sub": "device-user"},
+                {"referrer": "grok-build", "sub": "auth-user"},
+            ],
+        ), mock.patch.object(
+            gr._s2cpa,
+            "access_token_bfs",
+            return_value=None,
+        ), mock.patch.object(
+            gr._s2cpa,
+            "access_token_bot_risk",
+            return_value=False,
+        ), mock.patch.object(
+            gr._s2cpa,
+            "upload_cpa_auth_remote",
+            return_value="xai-fixture.json",
+        ) as upload:
+            result = {}
+            self.assertTrue(
+                gr.add_sso_to_cpa(
+                    "sso-value",
+                    email="fixture@example.com",
+                    result_out=result,
+                )
+            )
+
+        self.assertEqual(exchange.call_count, 2)
+        self.assertEqual(exchange.call_args_list[1].kwargs["prefer"], "auth_code")
+        self.assertFalse(exchange.call_args_list[1].kwargs["allow_fallback"])
+        self.assertEqual(upload.call_args.args[2]["access_token"], "auth-code")
+        self.assertEqual(result["mode"], "auth_code")
+
     def test_cpa_remote_http_session_does_not_inherit_environment_proxy(self):
         response = mock.Mock(status_code=200, reason="OK", text="")
         session = mock.MagicMock()

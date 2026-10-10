@@ -49,7 +49,7 @@ DEVICE_GRACE_PROTOCOL = 10
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
 GROK_REFERRER = "grok-build"
 GROK_PLAN = "generic"
-GROK_VERSION = "0.2.93"
+GROK_VERSION = "1.0.13"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -87,6 +87,25 @@ class WorkspaceSetupTests(unittest.TestCase):
         self.assertEqual(len(page.cookie_calls), 1)
         self.assertIn(("Fixture Team",), [args for _, args in page.run_js_calls])
 
+    def test_created_team_survives_api_key_handoff_failure(self):
+        page = WorkspacePage(advance=True)
+
+        with mock.patch.object(
+            workspace_module,
+            "_select_explore_and_pause",
+            side_effect=workspace_module.WorkspaceSetupError("API Key 页面未确认"),
+        ), mock.patch.object(workspace_module.time, "sleep"):
+            result = setup_workspace(
+                page,
+                "Fixture Team",
+                sso_token="secret-sso",
+                timeout=1,
+            )
+
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(result["team_id"], TEAM_ID)
+        self.assertIn("继续 CPA OAuth", result["error"])
+
     def test_missing_team_id_returns_failure_without_secret(self):
         page = WorkspacePage()
 
@@ -136,10 +155,7 @@ class WorkspaceSetupTests(unittest.TestCase):
             return_value=True,
         ) as dashboard_ready:
             with self.assertRaises(workspace_module.WorkspaceSetupError):
-                workspace_module._select_explore_and_pause(
-                    page,
-                    deadline=100.0,
-                )
+                workspace_module._select_explore_and_pause(page, deadline=100.0)
 
         dashboard_ready.assert_not_called()
 
@@ -157,6 +173,44 @@ class WorkspaceSetupTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertIn("Create API key", logs[-1])
 
+    def test_skip_route_home_uses_fallback_timer(self):
+        page = WorkspacePage()
+
+        with mock.patch.object(
+            workspace_module,
+            "_console_dashboard_ready",
+            return_value=True,
+        ), mock.patch.object(workspace_module.time, "sleep") as sleep:
+            result = workspace_module._finish_api_key_screen(
+                page,
+                force_after_key_clicks=True,
+            )
+
+        self.assertTrue(result)
+        sleep.assert_called_once_with(workspace_module.CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+
+    def test_skip_route_forces_cpa_after_direct_skip(self):
+        page = WorkspacePage()
+
+        with mock.patch.object(
+            workspace_module,
+            "_select_explore_starting_point",
+            return_value="skip",
+        ), mock.patch.object(
+            workspace_module,
+            "_finish_api_key_screen",
+            return_value=True,
+        ) as finish:
+            result = workspace_module._select_explore_and_pause(page, deadline=100.0)
+
+        self.assertTrue(result)
+        finish.assert_called_once_with(
+            page,
+            log_callback=None,
+            force_after_direct_skip=True,
+            force_after_key_clicks=True,
+        )
+
     def test_explore_route_can_click_direct_skip_for_now(self):
         page = WorkspacePage()
 
@@ -172,11 +226,56 @@ class WorkspaceSetupTests(unittest.TestCase):
             result = workspace_module._finish_api_key_screen(
                 page,
                 allow_direct_skip=True,
+                force_after_direct_skip=True,
             )
 
         self.assertTrue(result)
         click_skip.assert_called_once()
 
+    def test_explore_home_without_skip_uses_fallback_timer(self):
+        page = WorkspacePage()
+
+        with mock.patch.object(
+            workspace_module,
+            "_console_dashboard_ready",
+            return_value=True,
+        ), mock.patch.object(workspace_module.time, "sleep") as sleep:
+            result = workspace_module._finish_api_key_screen(
+                page,
+                allow_direct_skip=True,
+                force_after_direct_skip=True,
+            )
+
+        self.assertTrue(result)
+        sleep.assert_called_once_with(workspace_module.CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+
+    def test_explore_continue_uses_fixed_cpa_handoff_timer(self):
+        logs = []
+
+        with mock.patch.object(workspace_module.time, "sleep") as sleep:
+            result = workspace_module._force_cpa_after_explore_continue(logs.append)
+
+        self.assertTrue(result)
+        sleep.assert_called_once_with(workspace_module.CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+        self.assertIn("强制进入 CPA OAuth", logs[-1])
+
+    def test_explore_continue_attempts_skip_before_fixed_timer(self):
+        page = WorkspacePage()
+
+        with mock.patch.object(
+            workspace_module,
+            "_click_skip_for_now",
+            return_value=True,
+        ) as click_skip, mock.patch.object(
+            workspace_module,
+            "_force_cpa_after_explore_continue",
+            return_value=True,
+        ) as force_timer:
+            result = workspace_module._force_cpa_after_explore_continue_with_skip(page)
+
+        self.assertTrue(result)
+        click_skip.assert_called_once_with(page, log_callback=None)
+        force_timer.assert_called_once_with(log_callback=None)
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 CONSOLE_URL = "https://console.x.ai/"
 DEFAULT_WORKSPACE_NAME = "My xAI Team"
 AUTO_CLICK_DELAY_SECONDS = 1.0
-CONSOLE_HOME_IMPORT_DELAY_SECONDS = 8.0
+CONSOLE_HOME_IMPORT_DELAY_SECONDS = 30.0
 _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
@@ -338,7 +338,12 @@ def _select_explore_and_pause(page_obj, deadline, pause_seconds=0, log_callback=
         # deadline; slow Console redirects must not remove the debug window.
         time.sleep(pause)
     if selection == "skip":
-        plan_complete = _finish_api_key_screen(page_obj, log_callback=log_callback)
+        plan_complete = _finish_api_key_screen(
+            page_obj,
+            log_callback=log_callback,
+            force_after_direct_skip=True,
+            force_after_key_clicks=True,
+        )
     else:
         plan_complete = _click_plan_continue(page_obj, deadline, log_callback=log_callback)
     if not plan_complete:
@@ -350,7 +355,13 @@ def _select_explore_and_pause(page_obj, deadline, pause_seconds=0, log_callback=
     return bool(selection)
 
 
-def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False) -> bool:
+def _finish_api_key_screen(
+    page_obj,
+    log_callback=None,
+    allow_direct_skip=False,
+    force_after_direct_skip=False,
+    force_after_key_clicks=False,
+) -> bool:
     """Leave the one-time API-key screen without copying the key."""
     deadline = time.monotonic() + 30.0
     get_started_done = False
@@ -364,8 +375,27 @@ def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False)
         # dashboard detector explicitly rejects visible plan controls, so
         # this does not reintroduce the old Continue/Skip false positive.
         if _console_dashboard_ready(page_obj):
+            if force_after_key_clicks:
+                if log_callback:
+                    log_callback(
+                        "[workspace] Skip 路线已到 Console 首页，"
+                        f"{CONSOLE_HOME_IMPORT_DELAY_SECONDS:.0f}s 后进入 CPA OAuth"
+                    )
+                time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+                return True
+            if force_after_direct_skip and not skip_for_now_done:
+                if log_callback:
+                    log_callback(
+                        "[workspace] 已到 Console 首页但未出现 Skip for now，"
+                        f"{CONSOLE_HOME_IMPORT_DELAY_SECONDS:.0f}s 后强制进入 CPA OAuth"
+                    )
+                time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+                return True
             if log_callback:
-                log_callback("[workspace] 检测到 Create API key，8s 后开始 CPA OAuth")
+                log_callback(
+                    f"[workspace] 检测到 Create API key，"
+                    f"{CONSOLE_HOME_IMPORT_DELAY_SECONDS:.0f}s 后开始 CPA OAuth"
+                )
             time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
             return True
         raw_page = getattr(page_obj, "raw_page", None)
@@ -387,6 +417,8 @@ def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False)
                             log_callback=log_callback,
                         )
                         if skip_for_now_done:
+                            if force_after_direct_skip:
+                                return _force_cpa_after_direct_skip(log_callback=log_callback)
                             continue
                 elif not leave_anyway_done:
                     leave = raw_page.get_by_role("button", name="Leave anyway", exact=True).first
@@ -404,6 +436,8 @@ def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False)
                         log_callback=log_callback,
                     )
                     if skip_for_now_done:
+                        if force_after_direct_skip:
+                            return _force_cpa_after_direct_skip(log_callback=log_callback)
                         continue
             except Exception:
                 pass
@@ -420,6 +454,8 @@ def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False)
                     log_callback=log_callback,
                 )
                 if skip_for_now_done:
+                    if force_after_direct_skip:
+                        return _force_cpa_after_direct_skip(log_callback=log_callback)
                     continue
             except Exception:
                 pass
@@ -427,6 +463,8 @@ def _finish_api_key_screen(page_obj, log_callback=None, allow_direct_skip=False)
             if skip_for_now_done:
                 action = ""
             elif leave_anyway_done:
+                action = "skip for now"
+            elif allow_direct_skip:
                 action = "skip for now"
             else:
                 action = "leave anyway" if get_started_done else "get started"
@@ -472,6 +510,8 @@ return true;
                     skip_for_now_done = True
                     if log_callback:
                         log_callback("[workspace] 已点击 Skip for now")
+                    if force_after_direct_skip:
+                        return _force_cpa_after_direct_skip(log_callback=log_callback)
                     time.sleep(0.5)
                     continue
         except Exception:
@@ -512,7 +552,8 @@ const visible = (node) => {
 };
 const labels = controls.filter(visible).map(label);
 const normalizedLabels = labels.map((text) => text.replace(/^[^A-Za-z0-9]+/, '').trim());
-const hasApiKeyAction = normalizedLabels.some((text) => /^(Create API key|API Keys)$/i.test(text));
+const hasApiKeyAction = normalizedLabels.some((text) => /^(Create API key|API Keys)$/i.test(text))
+  || /\b(Create API key|API Keys)\b/i.test(body);
 const hasPlanControl = labels.some((text) => /^(Explore|Skip|Skip for now|Continue for free|Checkout|Get started|Leave anyway)$/i.test(text));
 return {
   ready: hasWelcome && hasDashboard && hasApiKeyAction && !hasPlanControl,
@@ -623,6 +664,36 @@ def _real_mouse_click_text(raw_page, target_text: str) -> bool:
     return False
 
 
+def _force_cpa_after_explore_continue(log_callback=None) -> bool:
+    """Use a fixed handoff timer for the Explore free-plan route."""
+    if log_callback:
+        log_callback(
+            "[workspace] Explore 免费路线已点击 Continue for free，"
+            f"{CONSOLE_HOME_IMPORT_DELAY_SECONDS:.0f}s 后强制进入 CPA OAuth"
+        )
+    time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+    return True
+
+
+def _force_cpa_after_direct_skip(log_callback=None) -> bool:
+    """Wait after clicking Skip for now on the Explore route."""
+    if log_callback:
+        log_callback(
+            "[workspace] Explore 路线已点击 Skip for now，"
+            f"{CONSOLE_HOME_IMPORT_DELAY_SECONDS:.0f}s 后强制进入 CPA OAuth"
+        )
+    time.sleep(CONSOLE_HOME_IMPORT_DELAY_SECONDS)
+    return True
+
+
+def _force_cpa_after_explore_continue_with_skip(page_obj, log_callback=None) -> bool:
+    """Try the Explore tour's Skip button, then always use the fixed timer."""
+    clicked = _click_skip_for_now(page_obj, log_callback=log_callback)
+    if not clicked and log_callback:
+        log_callback("[workspace] Continue for free 后未出现 Skip for now，直接进入固定计时")
+    return _force_cpa_after_explore_continue(log_callback=log_callback)
+
+
 def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
     """Submit the selected free plan without ever clicking Checkout."""
     wait_deadline = max(time.monotonic(), deadline)
@@ -634,15 +705,10 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                 if _real_mouse_click_text(raw_page, "Continue for free"):
                     if log_callback:
                         log_callback("[workspace] 已用真实鼠标点击 Continue for free，未点击 Checkout")
-                    if _finish_api_key_screen(
+                    return _force_cpa_after_explore_continue_with_skip(
                         page_obj,
                         log_callback=log_callback,
-                        allow_direct_skip=True,
-                    ):
-                        return True
-                    if log_callback:
-                        log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
-                    return False
+                    )
                 text_button = raw_page.get_by_text("Continue for free", exact=True).first
                 if text_button.count() and text_button.is_visible():
                     box = text_button.bounding_box()
@@ -654,15 +720,10 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                         )
                         if log_callback:
                             log_callback("[workspace] 已用真实鼠标点击 Continue for free，未点击 Checkout")
-                        if _finish_api_key_screen(
+                        return _force_cpa_after_explore_continue_with_skip(
                             page_obj,
                             log_callback=log_callback,
-                            allow_direct_skip=True,
-                        ):
-                            return True
-                        if log_callback:
-                            log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
-                        return False
+                        )
                 button = raw_page.get_by_role("button", name="Continue for free", exact=True).first
                 if not button.count():
                     button = raw_page.get_by_text("Continue for free", exact=True).first
@@ -671,15 +732,10 @@ def _click_plan_continue(page_obj, deadline, log_callback=None) -> bool:
                     button.click(timeout=3000)
                     if log_callback:
                         log_callback("[workspace] 已点击 Continue for free，未点击 Checkout")
-                    if _finish_api_key_screen(
+                    return _force_cpa_after_explore_continue_with_skip(
                         page_obj,
                         log_callback=log_callback,
-                        allow_direct_skip=True,
-                    ):
-                        return True
-                    if log_callback:
-                        log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
-                        return False
+                    )
             except Exception:
                 pass
         try:
@@ -725,15 +781,10 @@ return true;
             if result:
                 if log_callback:
                     log_callback("[workspace] 已点击 Continue for free，未点击 Checkout")
-                if _finish_api_key_screen(
+                return _force_cpa_after_explore_continue_with_skip(
                     page_obj,
                     log_callback=log_callback,
-                    allow_direct_skip=True,
-                ):
-                    return True
-                if log_callback:
-                    log_callback("[workspace] API Key 后续页面未确认，停止 OAuth")
-                return False
+                )
         except Exception:
             pass
         time.sleep(0.25)
@@ -893,6 +944,25 @@ def setup_workspace(
         return _result("failed", "", name, "", error)
 
     deadline = time.monotonic() + timeout_seconds
+
+    def _finish_onboarding_after_team_confirmed() -> str:
+        """Treat post-creation API-key UI failures as warnings, not workspace failures."""
+        try:
+            _select_explore_and_pause(
+                page_obj,
+                deadline,
+                pause_seconds=explore_pause_seconds,
+                log_callback=log_callback,
+            )
+        except WorkspaceSetupError as exc:
+            message = (
+                "Workspace 已创建，但 API Key 引导未确认；继续 CPA OAuth: "
+                f"{_sanitize(exc, token)}"
+            )
+            if log_callback:
+                log_callback(f"[workspace] {message}")
+            return message
+        return ""
     try:
         _raise_if_cancelled(cancel_callback)
         _set_sso_cookies(page_obj, token)
@@ -906,14 +976,18 @@ def setup_workspace(
             team_id = extract_team_id(current_url)
             if team_id:
                 status = "created" if fallback_used or initial_url else "already_configured"
-                if status == "created":
-                    _select_explore_and_pause(
-                        page_obj,
-                        deadline,
-                        pause_seconds=explore_pause_seconds,
-                        log_callback=log_callback,
-                    )
-                return _result(status, team_id, name, _sanitize(current_url, token))
+                onboarding_error = (
+                    _finish_onboarding_after_team_confirmed()
+                    if status == "created"
+                    else ""
+                )
+                return _result(
+                    status,
+                    team_id,
+                    name,
+                    _sanitize(current_url, token),
+                    onboarding_error,
+                )
 
             try:
                 state = _run_workspace_action(page_obj, name)
@@ -929,13 +1003,14 @@ def setup_workspace(
             current_url = state_url or _current_url(page_obj)
             team_id = extract_team_id(current_url)
             if team_id:
-                _select_explore_and_pause(
-                    page_obj,
-                    deadline,
-                    pause_seconds=explore_pause_seconds,
-                    log_callback=log_callback,
+                onboarding_error = _finish_onboarding_after_team_confirmed()
+                return _result(
+                    "created",
+                    team_id,
+                    name,
+                    _sanitize(current_url, token),
+                    onboarding_error,
                 )
-                return _result("created", team_id, name, _sanitize(current_url, token))
             if state.get("continue_clicked"):
                 team_id, current_url = _wait_for_team_url(
                     page_obj,
@@ -943,13 +1018,14 @@ def setup_workspace(
                     cancel_callback=cancel_callback,
                 )
                 if team_id:
-                    _select_explore_and_pause(
-                        page_obj,
-                        deadline,
-                        pause_seconds=explore_pause_seconds,
-                        log_callback=log_callback,
+                    onboarding_error = _finish_onboarding_after_team_confirmed()
+                    return _result(
+                        "created",
+                        team_id,
+                        name,
+                        _sanitize(current_url, token),
+                        onboarding_error,
                     )
-                    return _result("created", team_id, name, _sanitize(current_url, token))
 
             # 点击后没有及时推进时，重新访问根地址，让 console 重新解析会话和 workspace。
             if not fallback_used:

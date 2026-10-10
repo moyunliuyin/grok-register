@@ -1967,9 +1967,45 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
         record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
         access_token = str(record.get("access_token") or "")
         ap = _s2cpa.decode_jwt_payload(access_token)
-        ref = ap.get("referrer")
+        ref = str(ap.get("referrer") or "").strip()
+        required_referrer = str(
+            getattr(_s2cpa, "GROK_REFERRER", "grok-build") or "grok-build"
+        )
         if ref:
             _cpa_log(f"access_token referrer={ref!r}")
+        if token_mode == "device_browser" and ap and ref != required_referrer:
+            _cpa_log(
+                "浏览器 Device Flow token 缺少 "
+                f"referrer={required_referrer!r}，改用 Authorization Code 重换"
+            )
+            auth_token = _s2cpa.sso_to_token(
+                sso,
+                proxy=proxy,
+                log=_cpa_log,
+                prefer="auth_code",
+                allow_fallback=False,
+                browser_approve=None,
+            )
+            auth_access_token = str((auth_token or {}).get("access_token") or "")
+            auth_payload = _s2cpa.decode_jwt_payload(auth_access_token)
+            auth_ref = str(auth_payload.get("referrer") or "").strip()
+            if not auth_token or not auth_access_token or auth_ref != required_referrer:
+                reason = (
+                    "CPA token 缺少 "
+                    f"referrer={required_referrer!r}，Authorization Code 重换失败"
+                )
+                _set_result(status="failed", error=reason)
+                _cpa_log(reason)
+                _append_sso_pending(email, sso, log_callback=log_callback)
+                return False
+            token = auth_token
+            token_mode = "auth_code"
+            _set_result(mode=token_mode)
+            access_token = auth_access_token
+            ap = auth_payload
+            ref = auth_ref
+            _cpa_log(f"Authorization Code token referrer={ref!r}")
+        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
         bfs = _s2cpa.access_token_bfs(access_token)
         bot_risk = _s2cpa.access_token_bot_risk(access_token)
         _set_result(bfs=bfs if bfs is not None else "", bot_risk=bot_risk)
